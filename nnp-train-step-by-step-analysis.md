@@ -15,6 +15,165 @@ The training happens in **two distinct stages**:
 1. **Stage 1**: Train charge prediction neural networks (electrostatic)
 2. **Stage 2**: Train energy and force prediction neural networks (short-range)
 
+## Detailed Technical Process: Electronegativity → Charges
+
+### 1. **Neural Network Electronegativity Prediction**
+
+In Stage 1, the electrostatic neural networks **do not directly predict charges**. Instead, they predict **atomic electronegativity (χ)** values:
+
+```cpp
+// From Training.cpp - charge update process
+NeuralNetwork& nn = elements.at(ak.element).neuralNetworks.at("elec");
+nn.setInput(&(ak.G.front()));  // Input: symmetry functions
+nn.propagate();
+nn.getOutput(&(ak.chi));       // Output: electronegativity χ
+```
+
+#### What happens:
+- Each element (H, O, etc.) has its own **electrostatic neural network**
+- **Input**: Symmetry functions describing the local atomic environment
+- **Output**: Atomic electronegativity χ (single value per atom)
+- **Normalization**: χ values are normalized with `normalized("negativity", χ)`
+
+### 2. **Charge Equilibration (QEq) Process**
+
+The conversion from electronegativity to charges happens through **charge equilibration** - solving a system of linear equations based on electronegativity equalization principle.
+
+#### Mathematical Foundation:
+
+The charge equilibration is based on the principle that **all atoms in a molecule should have equal electronegativity** at equilibrium. The total electrostatic energy is:
+
+```
+E_elec = Σᵢ χᵢQᵢ + 0.5 Σᵢ JᵢᵢQᵢ² + 0.5 Σᵢ≠ⱼ JᵢⱼQᵢQⱼ
+```
+
+Where:
+- **χᵢ**: Electronegativity of atom i (from neural networks)
+- **Qᵢ**: Charge of atom i (to be determined)
+- **Jᵢᵢ**: Atomic hardness (element-specific parameter)
+- **Jᵢⱼ**: Coulomb interaction between atoms i and j
+
+#### The QEq System:
+
+Minimizing the electrostatic energy with respect to charges gives the **charge equilibration equations**:
+
+```
+∂E_elec/∂Qᵢ = χᵢ + JᵢᵢQᵢ + Σⱼ≠ᵢ JᵢⱼQⱼ = μ  (for all i)
+Σᵢ Qᵢ = Q_total                                    (charge conservation)
+```
+
+This forms a linear system **AQ = b** where:
+- **A**: Matrix containing hardness and Coulomb interactions
+- **Q**: Vector of atomic charges (unknowns)
+- **b**: Vector containing electronegativities and total charge constraint
+
+### 3. **Implementation Details**
+
+```cpp
+// From Structure.cpp - calculateElectrostaticEnergy()
+void Structure::calculateElectrostaticEnergy(...)
+{
+    // Setup the A matrix (hardness + Coulomb interactions)
+    A.resize(numAtoms + 1, numAtoms + 1);
+    
+    // Diagonal terms: atomic hardness
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        A(i,i) = hardness(atoms[i].element);
+    }
+    
+    // Off-diagonal terms: Coulomb interactions Jᵢⱼ
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        for (size_t j = i+1; j < numAtoms; ++j)
+        {
+            double Jij = calculateCoulombInteraction(i, j);
+            A(i,j) = A(j,i) = Jij;
+        }
+    }
+    
+    // Charge conservation constraint
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        A(numAtoms, i) = A(i, numAtoms) = 1.0;
+    }
+    A(numAtoms, numAtoms) = 0.0;
+    
+    // Setup RHS vector b
+    VectorXd b(numAtoms + 1);
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        b(i) = -atoms[i].chi;  // Negative electronegativity
+    }
+    b(numAtoms) = totalCharge;  // Usually 0 for neutral molecules
+    
+    // Solve the linear system: AQ = b
+    VectorXd charges = A.colPivHouseholderQr().solve(b);
+    
+    // Extract charges (exclude Lagrange multiplier)
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        atoms[i].charge = charges(i);
+    }
+}
+```
+
+### 4. **Coulomb Interaction Calculation**
+
+The Coulomb interactions **Jᵢⱼ** include several components:
+
+1. **Basic Coulomb interaction**: `1/(4πε₀rᵢⱼ)`
+2. **Gaussian charge distribution**: Using element-specific widths σᵢ, σⱼ
+3. **Ewald summation**: For periodic boundary conditions
+4. **Screening function**: For finite-range electrostatics
+
+```cpp
+// Gaussian-smeared Coulomb interaction
+double J_ij = erfc(r_ij / sqrt(2*(σᵢ² + σⱼ²))) / (4πε₀ * r_ij)
+```
+
+### 5. **Training Process for Charges**
+
+During Stage 1 training, the process for each update is:
+
+1. **Forward pass**: 
+   - Calculate electronegativity χᵢ for all atoms using current NN weights
+   - Solve QEq system to get charges Qᵢ from χᵢ values
+
+2. **Error calculation**:
+   - Compare predicted charges Qᵢ with reference charges Q_ref,i
+   - Calculate RMSE: `√(Σᵢ(Qᵢ - Q_ref,i)²/N)`
+
+3. **Gradient calculation**:
+   - Compute `∂RMSE/∂χᵢ` using chain rule through QEq system
+   - Compute `∂χᵢ/∂w` using backpropagation through neural networks
+   - Combine: `∂RMSE/∂w = Σᵢ (∂RMSE/∂χᵢ)(∂χᵢ/∂w)`
+
+4. **Weight update**:
+   - Update neural network weights using Kalman filter or gradient descent
+
+### 6. **Derivative Calculations**
+
+The key challenge is computing derivatives of charges with respect to electronegativities:
+
+```cpp
+// From Structure.cpp - calculateDQdChi()
+void Structure::calculateDQdChi(vector<Eigen::VectorXd> &dQdChi)
+{
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        VectorXd b(numAtoms+1);
+        b.setZero();
+        b(i) = -1.0;  // ∂b/∂χᵢ = -1 (since b contains -χ)
+        
+        // Solve: A * (∂Q/∂χᵢ) = ∂b/∂χᵢ
+        dQdChi.push_back(A.colPivHouseholderQr().solve(b).head(numAtoms));
+    }
+}
+```
+
+This gives **∂Qⱼ/∂χᵢ** for all atoms j with respect to electronegativity of atom i.
+
 ## Step-by-Step Process for `nnp-train 1`
 
 ### 1. **Initialization and Setup**
