@@ -1,5 +1,9 @@
 *.o
+*/src/*/.o
 compile_commands.json
 .clangd
+.claude
 .idea/
 src/interface/stable_29Sep2021.tar.gz
+src/makefile*
+src/application/makefile

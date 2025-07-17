@@ -44,7 +44,6 @@ endif
 APP_CORE=nnp-convert \
          nnp-cutoff \
          nnp-dist \
-         nnp-predict \
          nnp-prune \
          nnp-select \
          nnp-symfunc
@@ -56,6 +55,7 @@ APP_DATASET=nnp-atomenv \
             nnp-comp2 \
             nnp-dataset \
             nnp-norm \
+            nnp-predict \
             nnp-scaling
 
 # Applications which require libnnp and libnnptrain:

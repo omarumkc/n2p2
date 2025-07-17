@@ -14,10 +14,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include "Atom.h"
-#include "Prediction.h"
-#include "Structure.h"
+#include "Dataset.h"
+#include "mpi-extra.h"
 #include "utility.h"
+#include <mpi.h>
 #include <cstdlib>
 #include <iostream>
 #include <fstream>
@@ -30,6 +30,8 @@ using namespace nnp;
 int main(int argc, char* argv[])
 {
     bool structureInfo = false;
+    int numProcs = 0;
+    int myRank = 0;
 
     if (argc != 2)
     {
@@ -45,62 +47,69 @@ int main(int argc, char* argv[])
     }
 
     structureInfo = (bool)atoi(argv[1]);
+    
+    // Initialize MPI
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &numProcs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
 
     ofstream logFile;
     logFile.open("nnp-predict.log");
-    Prediction prediction;
-    prediction.log.registerStreamPointer(&logFile);
-    prediction.setup();
-    prediction.log << "\n";
-    prediction.log << "*** PREDICTION **************************"
-                      "**************************************\n";
-    prediction.log << "\n";
-    prediction.log << "Reading structure file...\n";
-    prediction.readStructureFromFile("input.data");
-    Structure& s = prediction.structure;
-    prediction.log << strpr("Structure contains %d atoms (%d elements).\n",
-                            s.numAtoms, s.numElements);
-    prediction.log << "Calculating NNP prediction...\n";
-    prediction.predict();
-    prediction.log << "\n";
-    prediction.logEwaldCutoffs();
-    prediction.log << "-----------------------------------------"
-                      "--------------------------------------\n";
-    prediction.log << strpr("NNP         total energy: %16.8E\n",
-                            prediction.structure.energy);
-    if (prediction.getNnpType() == Mode::NNPType::HDNNP_4G)
+    Dataset dataset;
+    if (myRank != 0) dataset.log.writeToStdout = false;
+    dataset.log.registerStreamPointer(&logFile);
+    dataset.setupMPI();
+    dataset.initialize();
+    dataset.loadSettingsFile();
+    dataset.setupGeneric();
+    dataset.setupSymmetryFunctionScaling();
+    dataset.setupSymmetryFunctionStatistics(false, false, true, false);
+    dataset.setupNeuralNetworkWeights();
+    dataset.log << "\n";
+    dataset.log << "*** PREDICTION **************************"
+                   "**************************************\n";
+    dataset.log << "\n";
+    dataset.log << "Reading structure file...\n";
+    dataset.distributeStructures(false); // false = don't shuffle
+    if (dataset.useNormalization()) dataset.toNormalizedUnits();
+    dataset.log << strpr("Found %zu configurations in input.data\n", dataset.structures.size());
+    dataset.log << "Calculating NNP predictions...\n";
+    
+    // Process each structure
+    for (size_t i = 0; i < dataset.structures.size(); ++i)
     {
-        prediction.log << strpr("NNP electrostatic energy: %16.8E\n",
-                                prediction.structure.energyElec);
-        prediction.log << "\n";
-        prediction.log << "NNP charges:\n";
-        for (auto const& a : s.atoms)
+        Structure& s = dataset.structures[i];
+        
+        // Calculate neighbor list and predictions for this structure
+        s.calculateNeighborList(dataset.getMaxCutoffRadius());
+        dataset.evaluateNNP(s);
+        
+        if (dataset.useNormalization()) 
         {
-            prediction.log << strpr("%10zu %2s %16.8E\n",
-                                    a.index + 1,
-                                    prediction.elementMap[a.element].c_str(),
-                                    a.charge);
+            s.toPhysicalUnits(dataset.getMeanEnergy(), 
+                             dataset.getConvEnergy(), 
+                             dataset.getConvLength(), 
+                             dataset.getConvCharge());
         }
-        prediction.log << strpr("NNP total charge: %16.8E (ref: %16.8E)\n",
-                          s.charge, s.chargeRef);
+        dataset.addEnergyOffset(s, false);
+        dataset.addEnergyOffset(s, true);
+        
+        dataset.log << strpr("Configuration %zu: %zu atoms\n", i + 1, s.numAtoms);
+        dataset.log << strpr("  NNP total energy: %16.8E\n", s.energy);
+        
+        if (dataset.getNnpType() == Mode::NNPType::HDNNP_4G)
+        {
+            dataset.log << strpr("  NNP electrostatic energy: %16.8E\n", s.energyElec);
+            dataset.log << strpr("  NNP total charge: %16.8E (ref: %16.8E)\n", s.charge, s.chargeRef);
+        }
     }
-    prediction.log << "\n";
-    prediction.log << "NNP forces:\n";
-    for (vector<Atom>::const_iterator it = s.atoms.begin();
-         it != s.atoms.end(); ++it)
-    {
-        prediction.log << strpr("%10zu %2s %16.8E %16.8E %16.8E\n",
-                                it->index + 1,
-                                prediction.elementMap[it->element].c_str(),
-                                it->element,
-                                it->f[0],
-                                it->f[1],
-                                it->f[2]);
-    }
-    prediction.log << "-----------------------------------------"
-                      "--------------------------------------\n";
-    prediction.log << "Writing output files...\n";
-    prediction.log << " - energy.out\n";
+    
+    dataset.log << "\n";
+    dataset.logEwaldCutoffs();
+    dataset.log << "-----------------------------------------"
+                   "--------------------------------------\n";
+    dataset.log << "Writing output files...\n";
+    dataset.log << " - energy.out\n";
     ofstream file;
     file.open("energy.out");
 
@@ -133,16 +142,21 @@ int main(int argc, char* argv[])
     appendLinesToFile(file,
                       createFileHeader(title, colSize, colName, colInfo));
 
-    file << strpr("%10zu %10zu %24.16E %24.16E %24.16E %24.16E\n",
-                  s.index + 1,
-                  s.numAtoms,
-                  s.energyRef,
-                  s.energy,
-                  (s.energyRef - s.energy) / s.numAtoms,
-                  prediction.getEnergyOffset(s));
+    // Write energy data for all structures
+    for (size_t i = 0; i < dataset.structures.size(); ++i)
+    {
+        Structure& s = dataset.structures[i];
+        file << strpr("%10zu %10zu %24.16E %24.16E %24.16E %24.16E\n",
+                      s.index + 1,
+                      s.numAtoms,
+                      s.energyRef,
+                      s.energy,
+                      (s.energyRef - s.energy) / s.numAtoms,
+                      dataset.getEnergyOffset(s));
+    }
     file.close();
 
-    prediction.log << " - nnatoms.out\n";
+    dataset.log << " - nnatoms.out\n";
     file.open("nnatoms.out");
 
     // File header.
@@ -176,21 +190,26 @@ int main(int argc, char* argv[])
     appendLinesToFile(file,
                       createFileHeader(title, colSize, colName, colInfo));
 
-    for (vector<Atom>::const_iterator it = s.atoms.begin();
-         it != s.atoms.end(); ++it)
+    // Write atomic data for all structures
+    for (size_t i = 0; i < dataset.structures.size(); ++i)
     {
-        file << strpr("%10zu %10zu %3zu %24.16E %24.16E %24.16E %24.16E\n",
-                      s.index + 1,
-                      it->index + 1,
-                      prediction.elementMap.atomicNumber(it->element),
-                      it->chargeRef,
-                      it->charge,
-                      0.0,
-                      it->energy);
+        Structure& s = dataset.structures[i];
+        for (vector<Atom>::const_iterator it = s.atoms.begin();
+             it != s.atoms.end(); ++it)
+        {
+            file << strpr("%10zu %10zu %3zu %24.16E %24.16E %24.16E %24.16E\n",
+                          s.index + 1,
+                          it->index + 1,
+                          dataset.elementMap.atomicNumber(it->element),
+                          it->chargeRef,
+                          it->charge,
+                          0.0,
+                          it->energy);
+        }
     }
     file.close();
 
-    prediction.log << " - nnforces.out\n";
+    dataset.log << " - nnforces.out\n";
     file.open("nnforces.out");
 
     // File header.
@@ -226,42 +245,56 @@ int main(int argc, char* argv[])
     appendLinesToFile(file,
                       createFileHeader(title, colSize, colName, colInfo));
 
-    for (vector<Atom>::const_iterator it = s.atoms.begin();
-         it != s.atoms.end(); ++it)
+    // Write force data for all structures
+    for (size_t i = 0; i < dataset.structures.size(); ++i)
     {
-        file << strpr("%10zu %10zu %24.16E %24.16E %24.16E %24.16E %24.16E "
-                      "%24.16E\n",
-                      s.index + 1,
-                      it->index + 1,
-                      it->fRef[0],
-                      it->fRef[1],
-                      it->fRef[2],
-                      it->f[0],
-                      it->f[1],
-                      it->f[2]);
+        Structure& s = dataset.structures[i];
+        for (vector<Atom>::const_iterator it = s.atoms.begin();
+             it != s.atoms.end(); ++it)
+        {
+            file << strpr("%10zu %10zu %24.16E %24.16E %24.16E %24.16E %24.16E "
+                          "%24.16E\n",
+                          s.index + 1,
+                          it->index + 1,
+                          it->fRef[0],
+                          it->fRef[1],
+                          it->fRef[2],
+                          it->f[0],
+                          it->f[1],
+                          it->f[2]);
+        }
     }
     file.close();
 
-    prediction.log << "Writing structure with NNP prediction "
-                      "to \"output.data\".\n";
+    dataset.log << "Writing structures with NNP predictions "
+                   "to \"output.data\".\n";
     file.open("output.data");
-    prediction.structure.writeToFile(&file, false);
+    for (size_t i = 0; i < dataset.structures.size(); ++i)
+    {
+        dataset.structures[i].writeToFile(&file, false);
+    }
     file.close();
 
     if (structureInfo)
     {
-        prediction.log << "Writing detailed structure information to "
-                          "\"structure.out\".\n";
+        dataset.log << "Writing detailed structure information to "
+                       "\"structure.out\".\n";
         file.open("structure.out");
-        vector<string> info = prediction.structure.info();
-        appendLinesToFile(file, info);
+        for (size_t i = 0; i < dataset.structures.size(); ++i)
+        {
+            file << "Configuration " << (i + 1) << ":\n";
+            vector<string> info = dataset.structures[i].info();
+            appendLinesToFile(file, info);
+            file << "\n";
+        }
         file.close();
     }
 
-    prediction.log << "Finished.\n";
-    prediction.log << "*****************************************"
-                      "**************************************\n";
+    dataset.log << "Finished.\n";
+    dataset.log << "*****************************************"
+                   "**************************************\n";
     logFile.close();
 
+    MPI_Finalize();
     return 0;
 }

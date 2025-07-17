@@ -18,8 +18,8 @@
 #define VERSION_H
 
 #define N2P2_VERSION "v2.3.0"
-#define N2P2_GIT_VERSION ""
-#define N2P2_GIT_REV ""
-#define N2P2_GIT_BRANCH ""
+#define N2P2_GIT_VERSION "v2.3.0-146-g29b9c9f1"
+#define N2P2_GIT_REV "29b9c9f10b1ac9ea45631b3d556a129ca3b701c2"
+#define N2P2_GIT_BRANCH "master"
 
 #endif
